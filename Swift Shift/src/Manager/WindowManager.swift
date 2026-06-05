@@ -38,6 +38,17 @@ class WindowManager {
             return rect
         }
     }
+    static func getScreenSnapRects() -> [CGRect] {
+        // NSScreen frames use Cocoa's bottom-left origin, while the snap math
+        // operates in CG's top-left origin (same space as getVisibleWindowRects),
+        // so flip each visibleFrame onto the primary display's height.
+        let primaryHeight = CGDisplayBounds(CGMainDisplayID()).height
+        return NSScreen.screens.map { screen in
+            let frame = screen.visibleFrame
+            let flippedY = primaryHeight - frame.origin.y - frame.height
+            return CGRect(x: frame.origin.x, y: flippedY, width: frame.width, height: frame.height)
+        }
+    }
     static func getCurrentWindow() -> AXUIElement? {
         guard let ev = CGEvent(source: nil) else { return nil }
         let sys = AXUIElementCreateSystemWide(); var el: AXUIElement?
