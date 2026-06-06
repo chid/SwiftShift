@@ -2,6 +2,37 @@ import Cocoa
 import Accessibility
 enum MouseAction: String { case move, resize, none }
 enum Quadrant { case topLeft, top, topRight, left, center, right, bottomLeft, bottom, bottomRight }
+
+private final class SnapPreviewWindow: NSWindow {
+    private let borderView = NSView()
+
+    init() {
+        super.init(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        ignoresMouseEvents = true
+        level = .screenSaver
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        hasShadow = false
+
+        borderView.wantsLayer = true
+        borderView.layer?.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.85).cgColor
+        borderView.layer?.borderWidth = 2
+        borderView.layer?.cornerRadius = 8
+        borderView.layer?.shadowColor = NSColor.black.cgColor
+        borderView.layer?.shadowOpacity = 0.24
+        borderView.layer?.shadowRadius = 12
+        borderView.layer?.shadowOffset = .zero
+        contentView = borderView
+    }
+
+    func show(frame: CGRect) {
+        let cocoaFrame = WindowManager.convertCGFrameToCocoaFrame(frame)
+        setFrame(cocoaFrame.insetBy(dx: 4, dy: 4), display: true)
+        if !isVisible { orderFrontRegardless() }
+    }
+}
+
 class MouseTracker {
     static let shared = MouseTracker()
     private var mouseEventMonitor: Any?, initialMouseLocation, initialWindowLocation: NSPoint?
@@ -9,12 +40,14 @@ class MouseTracker {
     private var currentAction: MouseAction = .none, trackingTimer: Timer?
     private let trackingTimeout: TimeInterval = 10, minimumUpdateInterval: TimeInterval = 1.0 / 120.0
     private var shouldUseQuadrants = false, quadrant: Quadrant?, windowSize: CGSize?, isTracking = false
-    private var requireOptionToSnap = false
+    private var enableSnapping = true
     private var spaceChangeObserver: Any?, pendingMouseLocation: NSPoint?, lastUpdateTime: TimeInterval = 0
     private var lastAppliedOrigin: NSPoint?, lastAppliedSize: CGSize?
     private var snapRects: [CGRect] = []
     private var screenSnapRects: [CGRect] = []
     private let snapDistance: CGFloat = 16
+    private let nativeSnapDistance: CGFloat = 32
+    private let snapPreviewWindow = SnapPreviewWindow()
     private let trackingQueue = DispatchQueue(label: "com.swiftshift.mousetracker")
     private init() { registerForSpaceChangeNotifications() }
     deinit { unregisterForSpaceChangeNotifications() }
@@ -51,7 +84,7 @@ class MouseTracker {
         guard let currentWindow = WindowManager.getCurrentWindow(), !shouldIgnore(window: currentWindow) else { trackedWindow = nil; return }
         shouldFocusWindow = PreferencesManager.loadBool(for: .focusOnApp)
         shouldUseQuadrants = PreferencesManager.loadBool(for: .useQuadrants)
-        requireOptionToSnap = PreferencesManager.loadBool(for: .requireOptionToSnap)
+        enableSnapping = PreferencesManager.loadBool(for: .enableSnapping, defaultValue: true)
         trackedWindowIsFocused = false; currentAction = action; initialMouseLocation = NSEvent.mouseLocation
         trackedWindow = currentWindow; initialWindowLocation = WindowManager.getPosition(window: currentWindow)
         windowSize = WindowManager.getSize(window: currentWindow); pendingMouseLocation = nil; lastUpdateTime = 0
@@ -112,6 +145,24 @@ class MouseTracker {
         let dx = loc.x - im.x, dy = loc.y - im.y
         var newO = NSPoint(x: iw.x + dx, y: iw.y - dy)
         if let size = windowSize, snappingActive() {
+            if let snapFrame = nativeSnapFrame(forCursor: loc) {
+                snapPreviewWindow.show(frame: snapFrame)
+                let snapOrigin = NSPoint(x: snapFrame.minX, y: snapFrame.minY)
+                let snapSize = CGSize(width: snapFrame.width, height: snapFrame.height)
+                let moveO = !pointsApproximatelyEqual(snapOrigin, lastAppliedOrigin)
+                if moveO || !sizesApproximatelyEqual(snapSize, lastAppliedSize) {
+                    lastAppliedOrigin = snapOrigin
+                    lastAppliedSize = snapSize
+                    WindowManager.resize(window: w, to: snapSize, from: snapOrigin, shouldMoveOrigin: true)
+                }
+                return
+            }
+            snapPreviewWindow.orderOut(nil)
+            if !sizesApproximatelyEqual(size, lastAppliedSize) {
+                WindowManager.resize(window: w, to: size, from: newO, shouldMoveOrigin: true)
+                lastAppliedOrigin = newO
+                lastAppliedSize = size
+            }
             // Align edges to neighbouring windows based on window geometry...
             newO = snappedOrigin(forMoving: CGRect(origin: newO, size: size))
             // ...but snap to screen edges based on cursor proximity. When moving,
@@ -119,6 +170,8 @@ class MouseTracker {
             // keying screen snapping off the cursor (which the user drags to the
             // edge) is what actually matches intent.
             newO = screenSnappedOrigin(newO, size: size, cursor: loc)
+        } else {
+            snapPreviewWindow.orderOut(nil)
         }
         if !pointsApproximatelyEqual(newO, lastAppliedOrigin) { lastAppliedOrigin = newO; WindowManager.move(window: w, to: newO) }
     }
@@ -153,10 +206,42 @@ class MouseTracker {
         }
     }
     private func snappingActive() -> Bool {
-        // When the preference is off, snapping is always on. When on, the user
-        // must hold ⌥ during the drag to engage magnetic snapping.
-        guard requireOptionToSnap else { return true }
-        return NSEvent.modifierFlags.contains(.option)
+        return enableSnapping
+    }
+    private func nativeSnapFrame(forCursor cursor: NSPoint) -> CGRect? {
+        let primaryHeight = CGDisplayBounds(CGMainDisplayID()).height
+        let cursorCG = NSPoint(x: cursor.x, y: primaryHeight - cursor.y)
+
+        for screen in screenSnapRects where screen.insetBy(dx: -nativeSnapDistance, dy: -nativeSnapDistance).contains(cursorCG) {
+            let nearLeft = abs(cursorCG.x - screen.minX) <= nativeSnapDistance
+            let nearRight = abs(cursorCG.x - screen.maxX) <= nativeSnapDistance
+            let nearTop = abs(cursorCG.y - screen.minY) <= nativeSnapDistance
+            let nearBottom = abs(cursorCG.y - screen.maxY) <= nativeSnapDistance
+
+            if nearTop && nearLeft {
+                return CGRect(x: screen.minX, y: screen.minY, width: screen.width / 2, height: screen.height / 2)
+            }
+            if nearTop && nearRight {
+                return CGRect(x: screen.midX, y: screen.minY, width: screen.width / 2, height: screen.height / 2)
+            }
+            if nearBottom && nearLeft {
+                return CGRect(x: screen.minX, y: screen.midY, width: screen.width / 2, height: screen.height / 2)
+            }
+            if nearBottom && nearRight {
+                return CGRect(x: screen.midX, y: screen.midY, width: screen.width / 2, height: screen.height / 2)
+            }
+            if nearTop {
+                return screen
+            }
+            if nearLeft {
+                return CGRect(x: screen.minX, y: screen.minY, width: screen.width / 2, height: screen.height)
+            }
+            if nearRight {
+                return CGRect(x: screen.midX, y: screen.minY, width: screen.width / 2, height: screen.height)
+            }
+        }
+
+        return nil
     }
     private func screenSnappedOrigin(_ origin: NSPoint, size: CGSize, cursor: NSPoint) -> NSPoint {
         // cursor is in Cocoa coordinates (bottom-left origin); screenSnapRects are
@@ -242,7 +327,7 @@ class MouseTracker {
     }
     private func invalidateTrackingTimer() { trackingTimer?.invalidate(); trackingTimer = nil }
     private func removeMouseEventMonitor() { if let m = mouseEventMonitor { NSEvent.removeMonitor(m); mouseEventMonitor = nil } }
-    private func resetTrackingVariables() { pendingMouseLocation = nil; lastUpdateTime = 0; lastAppliedOrigin = nil; lastAppliedSize = nil; snapRects = []; screenSnapRects = []; trackedWindow = nil; initialMouseLocation = nil; initialWindowLocation = nil; currentAction = .none; quadrant = nil; windowSize = nil }
+    private func resetTrackingVariables() { pendingMouseLocation = nil; lastUpdateTime = 0; lastAppliedOrigin = nil; lastAppliedSize = nil; snapRects = []; screenSnapRects = []; trackedWindow = nil; initialMouseLocation = nil; initialWindowLocation = nil; currentAction = .none; quadrant = nil; windowSize = nil; snapPreviewWindow.orderOut(nil) }
     func pauseTracking() { isTracking = false }
     func resumeTracking() { if currentAction != .none && trackedWindow != nil { isTracking = true } }
     private func checkForKeyPresses() -> Bool {
